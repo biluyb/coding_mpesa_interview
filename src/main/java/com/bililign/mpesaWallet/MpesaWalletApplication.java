@@ -1,0 +1,13 @@
+package com.bililign.mpesaWallet;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class MpesaWalletApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(MpesaWalletApplication.class, args);
+	}
+
+}
