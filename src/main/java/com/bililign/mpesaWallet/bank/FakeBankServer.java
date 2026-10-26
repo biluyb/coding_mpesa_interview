@@ -53,7 +53,7 @@ public class FakeBankServer {
         public final long amount;
         public final String bankRef;
         public volatile String initialResult; // ACCEPTED, REJECTED, NO_RESPONSE
-        public volatile String finalStatus;   // IN_PROGRESS, SUCCEEDED, FAILED, REJECTED
+        public volatile String finalStatus; // IN_PROGRESS, SUCCEEDED, FAILED, REJECTED
         public volatile boolean callbackSent = false;
 
         public PayoutRecord(String payoutId, String bankAccount, long amount, String bankRef) {
@@ -75,7 +75,7 @@ public class FakeBankServer {
 
         // Core spec endpoints
         server.createContext("/bank/payouts", new PayoutsHandler());
-        
+
         // Control & reconciliation endpoints (Rule B2 & B3)
         server.createContext("/bank/total-paid", exchange -> {
             String json = "{\"total_paid\": " + totalPaid.get() + "}";
@@ -132,19 +132,26 @@ public class FakeBankServer {
 
     private void parseAndApplyConfig(String json) {
         Double noResp = extractDouble(json, "no_response_rate");
-        if (noResp != null) noResponseRate = noResp;
+        if (noResp != null)
+            noResponseRate = noResp;
         Double rej = extractDouble(json, "reject_rate");
-        if (rej != null) rejectRate = rej;
+        if (rej != null)
+            rejectRate = rej;
         Double acc = extractDouble(json, "accept_rate");
-        if (acc != null) acceptRate = acc;
+        if (acc != null)
+            acceptRate = acc;
         Double dup = extractDouble(json, "duplicate_callback_rate");
-        if (dup != null) duplicateCallbackRate = dup;
+        if (dup != null)
+            duplicateCallbackRate = dup;
         Integer minLat = extractInt(json, "submit_latency_min_ms");
-        if (minLat != null) submitLatencyMinMs = minLat;
+        if (minLat != null)
+            submitLatencyMinMs = minLat;
         Integer maxLat = extractInt(json, "submit_latency_max_ms");
-        if (maxLat != null) submitLatencyMaxMs = maxLat;
+        if (maxLat != null)
+            submitLatencyMaxMs = maxLat;
         Integer hang = extractInt(json, "no_response_hang_ms");
-        if (hang != null) noResponseHangMs = hang;
+        if (hang != null)
+            noResponseHangMs = hang;
     }
 
     private class PayoutsHandler implements HttpHandler {
@@ -203,7 +210,7 @@ public class FakeBankServer {
         PayoutRecord record = new PayoutRecord(payoutId, bankAccount, amount, bankRef);
 
         double roll = ThreadLocalRandom.current().nextDouble();
-        
+
         if (roll < noResponseRate) {
             // 12% get no response: stays open for 60 seconds (or configured hang), then 504
             record.initialResult = "NO_RESPONSE";
@@ -244,7 +251,8 @@ public class FakeBankServer {
         }
         payouts.put(payoutId, record);
 
-        // Callback delay: 1 to 10 seconds. Notice it can fire BEFORE the submit call finishes!
+        // Callback delay: 1 to 10 seconds. Notice it can fire BEFORE the submit call
+        // finishes!
         int callbackDelay = randomBetween(callbackDelayMinMs, callbackDelayMaxMs);
         scheduleCallback(record, callbackDelay);
 
@@ -281,12 +289,12 @@ public class FakeBankServer {
     }
 
     private void sendCallbackWithRetry(int port, String eventId, PayoutRecord record, int retryCount) {
-        if (retryCount > 5) return;
+        if (retryCount > 5)
+            return;
 
         String callbackJson = String.format(
                 "{\"event_id\": \"%s\", \"payout_id\": \"%s\", \"bank_ref\": \"%s\", \"status\": \"%s\"}",
-                eventId, record.payoutId, record.bankRef, record.finalStatus
-        );
+                eventId, record.payoutId, record.bankRef, record.finalStatus);
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/mpesa/v1/callbacks/bank"))
@@ -335,7 +343,8 @@ public class FakeBankServer {
     }
 
     private static int randomBetween(int min, int max) {
-        if (min >= max) return min;
+        if (min >= max)
+            return min;
         return ThreadLocalRandom.current().nextInt(min, max + 1);
     }
 
