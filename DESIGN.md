@@ -1,59 +1,63 @@
-# DESIGN.md
+# Design & Architecture Notes
 
 ## Written Answers
 
 ### Q1: Every Wait
-In this implementation, thread waits occur in four distinct locations:
+Thread waits in this system are strictly bounded and isolated to prevent cascading slowdowns:
 
-1. **Hikari Connection Pool**:
-   - *Wait point*: Worker threads requesting a JDBC connection via `DataSource.getConnection()`.
-   - *Bound*: Explicitly bounded by `hikari.connection-timeout=2000` (2,000 ms). If all 10 connections are busy for >2 seconds, Hikari throws `SQLTransientConnectionException`, mapped to `503 SERVICE_UNAVAILABLE`. HTTP calls to the bank never hold connections, preventing pool exhaustion.
+1. **Hikari Database Connection Pool (10 connections)**
+   - **Where it waits**: Threads calling `DataSource.getConnection()` when all 10 pool connections are in use.
+   - **Timeout & behavior**: Hard-capped at 2 seconds (`hikari.connection-timeout=2000`). If connections aren't freed in time, Hikari throws `SQLTransientConnectionException`, which our global handler maps to `503 SERVICE_UNAVAILABLE`. External bank calls never hold database connections, which keeps pool churn low and fast.
 
-2. **Row Locks in PostgreSQL (`SELECT ... FOR UPDATE`)**:
-   - *Wait point*: Threads contending for wallet rows (transfers/reversals/payout reservations) or payout records.
-   - *Bound*: Bounded by Postgres transaction timeout / statement timeout (2,000 ms) and Hikari's 2-second timeout. Deadlocks between multiple wallets are eliminated entirely by lexicographical lock ordering (`min(wallet_id)` locked before `max(wallet_id)`).
+2. **Database Row Locks (`SELECT ... FOR UPDATE`)**
+   - **Where it waits**: Worker threads contending for the same wallet rows during transfers, reversals, or payout reservations.
+   - **Timeout & behavior**: Bounded by Hikari's 2-second timeout and PostgreSQL statement limits. We completely prevent deadlocks by always sorting and locking wallets in alphabetical order (`min(wallet_id)` before `max(wallet_id)`).
 
-3. **External Bank HTTP Dispatch**:
-   - *Wait point*: Bank client making HTTP calls to `POST /bank/payouts` and `GET /bank/payouts/{id}`.
-   - *Bound*: HTTP client connection timeout is bounded at 2 seconds; request timeout is hard-bounded at 8 seconds (`Duration.ofSeconds(8)`). Crucially, these calls execute inside a separate fixed executor pool (`bankDispatchExecutor`), completely decoupled from Tomcat request threads and holding zero DB connections.
+3. **External Bank HTTP Dispatch**
+   - **Where it waits**: HTTP calls to `POST /bank/payouts` and `GET /bank/payouts/{id}`.
+   - **Timeout & behavior**: Connection timeout is set to 2 seconds, and the request timeout is capped at 8 seconds. These calls run exclusively on a dedicated background thread pool (`bankDispatchExecutor`), so they never hold Tomcat request threads or database connections.
 
-4. **Idempotency In-Progress Spin-Wait**:
-   - *Wait point*: Concurrent requests arriving with an identical `Idempotency-Key` while the initial request is in progress.
-   - *Bound*: Bounded by a 2.5-second polling loop with 50 ms backoff. If the in-flight request does not complete within 2.5 seconds, it aborts and returns `409 REQUEST_IN_PROGRESS`.
+4. **Idempotency Spin-Wait**
+   - **Where it waits**: When two duplicate requests with the same `Idempotency-Key` hit the service at the same time while the first one is still being processed.
+   - **Timeout & behavior**: The second thread polls every 50ms for up to 2.5 seconds. If the first request finishes in that window, the second request returns the cached result. If it takes longer than 2.5 seconds, it returns `409 REQUEST_IN_PROGRESS`.
 
 ---
 
 ### Q2: Database Restart During Payout
-Scenario: PostgreSQL restarts after funds are reserved in Step A, but before the bank response or callback is processed in Step C.
+**Scenario**: PostgreSQL restarts after funds are reserved (Step A), but before the bank responds or sends a callback (Step C).
 
-1. **Reservation Preservation**: The reservation transaction committed in Phase A before Postgres went down. PostgreSQL WAL ensures crash durability. The wallet row retains `reserved = reserved + 5000` and the payout row exists with `status = 'PENDING'`. Available funds remain safe (`available = balance - reserved`), preventing any double-spend or overdraft.
-2. **Bank Interaction During DB Outage**: The asynchronous bank dispatch thread was already dispatched (or is attempting HTTP dispatch). If the bank finishes while Postgres is restarting:
-   - If a callback arrives at either instance on `/mpesa/v1/callbacks/bank`, the DB connection fails (`503`). The fake bank retries every 3 seconds up to 5 times.
-   - If the async HTTP call receives bank acceptance or rejection, its attempt to open a DB transaction fails and drops quietly.
-3. **Recovery After DB Restart**: Once Postgres restarts, the next callback retry succeeds, acquires the payout row lock, and finalizes the ledger. If callbacks were lost or never arrived (e.g. 504 hang), `PayoutReconciler` triggers via `@Scheduled(fixedDelay = 2000)`, claims the pending payout using `SELECT ... FOR UPDATE SKIP LOCKED`, queries `GET /bank/payouts/{payout_id}`, and finalizes the payout to `SUCCEEDED` (debiting balance & releasing reservation) or `FAILED` (releasing reservation only). No funds are ever lost or permanently stuck.
-
----
-
-### Q3: What You Left Out
-1. **API 5.6 (B2C Batch Disbursements)**:
-   - *Why it is hard*: Processing up to 5,000 disbursements while maintaining <300 ms p95 on concurrent transfers out of the source wallet. Holding a row lock across 5,000 sequential row debits would starve transfers for seconds.
-   - *How to build it*: Chunk the batch into smaller atomic sub-transactions (e.g., chunks of 50 rows). In each chunk, acquire source wallet lock briefly, debit chunk amount, update individual recipient rows, and commit immediately. Resubmissions under the same `batch_id` compare a SHA-256 hash of all rows stored on the batch master record to reject changes with 409, while returning current progress for matching batches.
-
-2. **Full End-to-End Test Suite S6 (Disbursements)**:
-   - Left out to prioritize rock-solid verification and zero-leak guarantees on the core money paths: P2P transfers (S1), reversals (S2), wallet freezes (S3), and asynchronous bank payouts & callbacks (S4, S5).
+1. **Funds Remain Safe in the WAL**: The initial reservation transaction commits before the database drops. PostgreSQL's write-ahead log ensures durability. The wallet still reflects `reserved = reserved + amount` and the payout stays `PENDING`. Because available balance is `balance - reserved`, the user cannot spend or withdraw those reserved funds elsewhere.
+2. **Handling Traffic During Downtime**:
+   - If the bank callback arrives while Postgres is restarting, the connection fails and returns `503`. The bank retries up to 5 times every 3 seconds.
+   - If the background dispatch thread gets an immediate bank response while the database is down, it drops gracefully without corrupting state.
+3. **Automatic Recovery on Restart**:
+   - Once Postgres is back online, the next bank callback retry succeeds, locks the payout record, and finalizes the ledger.
+   - If the callback was dropped entirely or the bank hung, our background `PayoutReconciler` picks up the pending payout after 5 seconds, queries the bank's status endpoint, and finalizes the transaction to `SUCCEEDED` (deducts balance and clears reservation) or `FAILED` (releases reservation only). Funds are never stranded.
 
 ---
 
-## Decisions Left Open by Specification
+### Q3: What Was Left Out
 
-1. **Transaction Isolation Level**:
-   - *Choice*: `READ COMMITTED` paired with explicit pessimistic locking (`SELECT ... FOR UPDATE`).
-   - *Rationale*: PostgreSQL's `SERIALIZABLE` level introduces serialization failures (`40001`) under high write concurrency, forcing complex retry loops that could exhaust the 10-connection pool. Explicit deterministic lock ordering (`min(w1, w2)` then `max(w1, w2)`) under `READ COMMITTED` guarantees serial consistency without serialization aborts or deadlocks.
+1. **B2C Bulk Disbursements (Section 5.6)**
+   - **Why it is challenging**: A single request can contain up to 5,000 disbursements from one company wallet. Holding a row lock while processing 5,000 transfers sequentially would block all other activity on that wallet for seconds and blow past our latency SLAs.
+   - **How to build it properly**: Process the batch in small, chunked transactions (e.g., 50 rows per chunk). Each chunk locks the source wallet briefly, debits the chunk total, credits the recipients, and commits immediately. Store a SHA-256 hash of the entire payload on the batch record to reject tampering with `409 Conflict`, while allowing safe re-checks on matching batch IDs.
 
-2. **Concurrent Idempotency Handling**:
-   - *Choice*: Poll with backoff up to 2.5 seconds, then fallback to `409 REQUEST_IN_PROGRESS`.
-   - *Rationale*: S1.2 requires that concurrent duplicate requests return the original `transfer_id`. Short polling ensures concurrent threads wait for the winning thread's commit and replay the cached 201 response seamlessly.
+2. **Disbursement End-to-End Test Suite (S6)**
+   - We deferred the bulk disbursement test suite to focus engineering effort on rock-solid correctness for the core financial operations: P2P transfers, exact reversals, account freezing, and asynchronous bank payouts with automated reconciliation.
 
-3. **Decoupled Payout Architecture (Saga / Three-Phase Payout)**:
-   - *Choice*: Split payout into Phase A (Reserve funds & create PENDING record in DB <15ms), Phase B (Non-blocking HTTP dispatch without holding DB connection), and Phase C (Finalize upon callback or background polling).
-   - *Rationale*: Guarantees <500 ms p95 response time regardless of bank latency (2–60s) and protects Hikari's 10-connection pool from starvation.
+---
+
+## Architectural Decisions & Trade-offs
+
+1. **Pessimistic Locking over Serializable Isolation**
+   - We chose `READ COMMITTED` with explicit `SELECT ... FOR UPDATE` over PostgreSQL's `SERIALIZABLE` isolation level. Under heavy concurrent load on popular wallets, `SERIALIZABLE` triggers frequent serialization failure aborts (`40001`), requiring application-level retries that quickly exhaust our 10-connection pool. Explicit lock ordering (`min` then `max`) gives us strict serial execution without deadlock risk or retry overhead.
+
+2. **Idempotency with Short-Polling**
+   - Instead of immediately rejecting concurrent duplicate requests with an error, we hold the duplicate request for up to 2.5 seconds with periodic checks. This allows the second request to receive the exact same response as the first without requiring client-side retry logic.
+
+3. **Three-Phase Payout Pipeline**
+   - Payouts are decoupled into three distinct stages:
+     - **Phase A**: Lock row, reserve funds, create `PENDING` record, and commit (<15ms). Return `202 Accepted` immediately.
+     - **Phase B**: Dispatch HTTP request to the external bank asynchronously on a separate thread pool without holding database connections.
+     - **Phase C**: Finalize ledger upon receiving bank webhook callback, or reconcile via scheduled background polling if callbacks fail.
+   - This design isolates slow third-party banking latency (2–60s) from our core API threads and protects database connections from starvation.
