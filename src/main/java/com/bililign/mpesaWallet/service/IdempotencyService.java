@@ -68,7 +68,11 @@ public class IdempotencyService {
                 if (response.getBody() instanceof String s) {
                     responseBodyJson = s;
                 } else {
-                    responseBodyJson = objectMapper.writeValueAsString(response.getBody());
+                    try {
+                        responseBodyJson = objectMapper.writeValueAsString(response.getBody());
+                    } catch (Exception ignored) {
+                        responseBodyJson = String.valueOf(response.getBody());
+                    }
                 }
             }
 
